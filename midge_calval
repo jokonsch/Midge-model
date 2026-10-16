@@ -1,0 +1,573 @@
+import csv
+from collections import defaultdict
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.optimize import least_squares
+
+# --- PARAMETERS ---
+trap_type = 'LT'
+calibration_target = (2, 2024)
+validation_targets = ((1, 2024), (2, 2025))
+
+# These are the starting values for calibration.
+k_oviposition = 0.9
+k_emerge = 0.001
+eggs_per_female = 3_000
+initial_cohort_size = 1_000_000  # aquatic midges waiting for T >= 15°C
+
+# Calibration bounds: k_emerge is a fraction, while initial_cohort_size is
+# the number of aquatic midges in the initial cohort.
+calibration_lower_bounds = np.array([0.01, 1e-6, 1e4])
+calibration_upper_bounds = np.array([1.0, 0.1, 1e9])
+
+
+def d_first(temperature):
+    """Return the temperature-dependent delay to first emergence."""
+    temperature_for_calculation = min(temperature, 22.5)
+    return max(
+        -0.3467 * temperature_for_calculation**2
+        + 10.333 * temperature_for_calculation
+        - 36.0,
+        0.0
+    )
+
+
+EMERGENCE_CURVE_DAYS = np.array([
+    32, 33, 34, 36, 38, 39, 41, 44, 46, 48,
+    51, 52, 53, 54, 58, 59, 60, 61, 62
+], dtype=float)
+EMERGENCE_CURVE_FRACTIONS = np.array([
+    0.026548673, 0.061946903, 0.088495575, 0.132743363,
+    0.168141593, 0.194690265, 0.230088496, 0.265486726,
+    0.318584071, 0.345132743, 0.407079646, 0.469026549,
+    0.522123894, 0.575221239, 0.716814159, 0.778761062,
+    0.849557522, 0.938053097, 1.0
+], dtype=float)
+
+
+def cumulative_emergence_fraction(days_after_egg_laying):
+    """Return the interpolated cumulative emergence fraction at a given age."""
+    if days_after_egg_laying < EMERGENCE_CURVE_DAYS[0]:
+        return 0.0
+    if days_after_egg_laying >= EMERGENCE_CURVE_DAYS[-1]:
+        return 1.0
+    return float(np.interp(
+        days_after_egg_laying,
+        EMERGENCE_CURVE_DAYS,
+        EMERGENCE_CURVE_FRACTIONS
+    ))
+
+
+temperature_file = Path(__file__).with_name(
+    'pond_temperatures_interpolated.csv'
+)
+midge_file = Path(__file__).with_name('midges_all.csv')
+
+
+def season_label(first_year):
+    """Return the season label used in output and plot titles."""
+    return f'{first_year}-{str(first_year + 1)[-2:]}'
+
+
+def load_temperature_data(pond_number):
+    """Load all available pond temperatures indexed by date."""
+    temperatures_by_date = {}
+    with temperature_file.open(newline='', encoding='utf-8-sig') as csv_file:
+        reader = csv.DictReader(csv_file)
+        for row in reader:
+            date = datetime.strptime(row['Date'], '%Y-%m-%d')
+            temperature = row[f'Pond {pond_number}']
+            if temperature:
+                temperatures_by_date[date] = float(temperature)
+    return temperatures_by_date
+
+
+def load_midge_data(pond_number):
+    """Load trap counts grouped by date and trap name."""
+    counts_by_date = defaultdict(list)
+    with midge_file.open(newline='', encoding='utf-8-sig') as csv_file:
+        reader = csv.DictReader(csv_file)
+        for row in reader:
+            if (
+                int(row['Pond']) == pond_number
+                and row['Type'] == trap_type
+            ):
+                count_text = row['Count'].strip()
+                if not count_text or count_text.lower() == 'n/a':
+                    continue
+                date = datetime.strptime(row['Date'], '%d/%m/%Y')
+                counts_by_date[date].append(float(count_text))
+    return counts_by_date
+
+
+def load_season(
+    pond_number, first_year, temperatures_by_date, midge_counts_by_date
+):
+    """Prepare interpolated temperature and averaged trap data for one season."""
+    start_date = datetime(first_year, 9, 1)
+    end_date = datetime(first_year + 1, 5, 31)
+    dates = [
+        start_date + timedelta(days=day)
+        for day in range((end_date - start_date).days + 1)
+    ]
+    available_dates = sorted(
+        date for date in dates if date in temperatures_by_date
+    )
+    if not available_dates:
+        raise ValueError(
+            f'No pond {pond_number} temperature data found for season '
+            f'{season_label(first_year)}.'
+        )
+    measurement_dates = np.array([
+        (date - start_date).days for date in available_dates
+    ], dtype=float)
+    measurement_temperatures = np.array([
+        temperatures_by_date[date] for date in available_dates
+    ])
+    temperatures = np.interp(
+        np.arange(len(dates), dtype=float),
+        measurement_dates,
+        measurement_temperatures
+    )
+
+    midge_measurements = sorted(
+        (date, np.mean(counts))
+        for date, counts in midge_counts_by_date.items()
+        if start_date <= date <= end_date
+    )
+    if not midge_measurements:
+        raise ValueError(
+            f'No {trap_type} midge data found for pond {pond_number} '
+            f'in season {season_label(first_year)}.'
+        )
+
+    # Each count is the total catch accumulated since the previous
+    # measurement. Store the intervals so model output can be aggregated
+    # over the same periods.
+    measurement_intervals = []
+    first_measurement_date, first_count = midge_measurements[0]
+    first_interval_days = 7
+    first_day = (
+        (first_measurement_date - start_date).days
+        - first_interval_days
+        + 1
+    )
+    last_day = (first_measurement_date - start_date).days + 1
+    if first_day < 0:
+        raise ValueError(
+            f'The first midge measurement for season '
+            f'{season_label(first_year)} starts before the temperature data.'
+        )
+    measurement_intervals.append((first_day, last_day, first_count))
+
+    for previous_measurement, current_measurement in zip(
+        midge_measurements, midge_measurements[1:]
+    ):
+        previous_date, _ = previous_measurement
+        current_date, count = current_measurement
+        interval_days = (current_date - previous_date).days
+        if interval_days <= 0:
+            raise ValueError('Midge measurement dates must be strictly increasing.')
+
+        first_day = (previous_date - start_date).days + 1
+        last_day = (current_date - start_date).days + 1
+        measurement_intervals.append((first_day, last_day, count))
+
+    measured_midges = spread_interval_totals(
+        len(dates), measurement_intervals
+    )
+    return dates, temperatures, measurement_intervals, measured_midges
+
+
+def spread_interval_totals(num_days, intervals):
+    """Spread each interval total evenly across its observed days."""
+    daily_values = np.full(num_days, np.nan)
+    for first_day, last_day, total in intervals:
+        interval_days = last_day - first_day
+        daily_values[first_day:last_day] = total / interval_days
+    return daily_values
+
+
+def aggregate_daily_values(daily_values, intervals):
+    """Aggregate daily model values over the observed measurement intervals."""
+    return [
+        float(np.sum(daily_values[first_day:last_day]))
+        for first_day, last_day, _ in intervals
+    ]
+
+
+def cumulative_median_date(dates, daily_values):
+    """Return the date on which cumulative emergence reaches 50%."""
+    daily_values = np.nan_to_num(daily_values, nan=0.0)
+    total = np.sum(daily_values)
+    if total <= 0:
+        return None
+    cumulative = np.cumsum(daily_values)
+    index = np.searchsorted(cumulative, total / 2.0)
+    return dates[min(index, len(dates) - 1)]
+
+
+def calculate_fit_metrics(
+    dates, measurement_intervals, observed_totals, modelled_totals,
+    observed_daily, modelled_daily
+):
+    """Calculate interval-level magnitude, bias, and timing metrics."""
+    errors = modelled_totals - observed_totals
+    mae = np.mean(np.abs(errors))
+    rmse = np.sqrt(np.mean(errors**2))
+    mean_observed = np.mean(observed_totals)
+    nrmse = rmse / mean_observed if mean_observed else np.nan
+    bias = np.mean(errors)
+    observed_total = np.sum(observed_totals)
+    seasonal_bias = (
+        (np.sum(modelled_totals) - observed_total) / observed_total
+        if observed_total else np.nan
+    )
+    if (
+        len(observed_totals) > 1
+        and np.std(observed_totals) > 0
+        and np.std(modelled_totals) > 0
+    ):
+        correlation = float(np.corrcoef(
+            observed_totals, modelled_totals
+        )[0, 1])
+    else:
+        correlation = np.nan
+
+    observed_peak = int(np.argmax(observed_totals))
+    modelled_peak = int(np.argmax(modelled_totals))
+    observed_peak_date = dates[
+        measurement_intervals[observed_peak][1] - 1
+    ]
+    modelled_peak_date = dates[
+        measurement_intervals[modelled_peak][1] - 1
+    ]
+    observed_median_date = cumulative_median_date(dates, observed_daily)
+    modelled_median_date = cumulative_median_date(dates, modelled_daily)
+    median_date_error = (
+        (modelled_median_date - observed_median_date).days
+        if observed_median_date is not None
+        and modelled_median_date is not None
+        else np.nan
+    )
+    return {
+        'mae': mae,
+        'rmse': rmse,
+        'nrmse': nrmse,
+        'bias': bias,
+        'seasonal_bias': seasonal_bias,
+        'correlation': correlation,
+        'observed_peak_date': observed_peak_date,
+        'modelled_peak_date': modelled_peak_date,
+        'peak_date_error': (modelled_peak_date - observed_peak_date).days,
+        'observed_median_date': observed_median_date,
+        'modelled_median_date': modelled_median_date,
+        'median_date_error': median_date_error,
+    }
+
+
+def simulate(temperatures, k_oviposition, k_emerge, initial_cohort_size):
+    """Run the model and return aquatic population and daily emergence."""
+    num_days = len(temperatures)
+    aquatic_midge = np.zeros(num_days)
+    emergence = np.zeros(num_days)
+    cohorts = [{
+        'size': initial_cohort_size,
+        'D_first': None,
+        'start_day': None,
+        'emergence_curve_day': None,
+        'emerged_so_far': 0.0,
+        'emergence_fraction_so_far': 0.0,
+        'resolved': False
+    }]
+
+    for t in range(num_days):
+        todays_emergence = 0.0
+
+        for cohort in cohorts:
+            if cohort['resolved']:
+                continue
+
+            if temperatures[t] < 15.0:
+                continue
+
+            if cohort['D_first'] is None:
+                cohort['D_first'] = d_first(temperatures[t])
+                cohort['start_day'] = int(np.ceil(t + cohort['D_first']))
+
+            if t >= cohort['start_day']:
+                if cohort['emergence_curve_day'] is None:
+                    cohort['emergence_curve_day'] = 32
+                else:
+                    cohort['emergence_curve_day'] += 1
+                cumulative_fraction = cumulative_emergence_fraction(
+                    cohort['emergence_curve_day']
+                )
+                daily_emerge = cohort['size'] * k_emerge * (
+                    cumulative_fraction
+                    - cohort['emergence_fraction_so_far']
+                )
+                todays_emergence += daily_emerge
+                cohort['emerged_so_far'] += daily_emerge
+                cohort['emergence_fraction_so_far'] = cumulative_fraction
+                if cumulative_fraction >= 1.0:
+                    cohort['resolved'] = True
+
+        emergence[t] = todays_emergence
+
+        if t > 0:
+            new_size = emergence[t - 1] * 0.5 * k_oviposition * eggs_per_female
+            if new_size > 0:
+                cohorts.append({
+                    'size': new_size,
+                    'D_first': None,
+                    'start_day': None,
+                    'emergence_curve_day': None,
+                    'emerged_so_far': 0.0,
+                    'emergence_fraction_so_far': 0.0,
+                    'resolved': False
+                })
+
+        aquatic_midge[t] = sum(
+            cohort['size'] - cohort['emerged_so_far']
+            for cohort in cohorts if not cohort['resolved']
+        )
+
+    return aquatic_midge, emergence
+
+
+def calibrate_season(
+    dates, temperatures, measurement_intervals, measured_midges,
+    initial_parameters=None
+):
+    """Calibrate the model against one season's observations."""
+    observed_totals = np.array([
+        total for _, _, total in measurement_intervals
+    ])
+
+    def residuals(log_parameters):
+        """Residuals at observations; log parameters enforce positivity."""
+        parameters = np.exp(log_parameters)
+        _, modelled_emergence = simulate(temperatures, *parameters)
+        modelled_totals = np.array(aggregate_daily_values(
+            modelled_emergence, measurement_intervals
+        ))
+        return modelled_totals - observed_totals
+
+    if initial_parameters is None:
+        initial_parameters = np.array([
+            k_oviposition,
+            k_emerge,
+            initial_cohort_size
+        ])
+    calibration_result = least_squares(
+        residuals,
+        x0=np.log(initial_parameters),
+        bounds=(
+            np.log(calibration_lower_bounds),
+            np.log(calibration_upper_bounds)
+        ),
+        max_nfev=500
+    )
+    if not calibration_result.success:
+        raise RuntimeError(
+            f'Calibration failed: {calibration_result.message}'
+        )
+
+    parameters = np.exp(calibration_result.x)
+    aquatic_midge, emergence = simulate(temperatures, *parameters)
+    modelled_totals = np.array(aggregate_daily_values(
+        emergence, measurement_intervals
+    ))
+    modelled_midges = spread_interval_totals(
+        len(temperatures),
+        [
+            (first_day, last_day, total)
+            for (first_day, last_day, _), total in zip(
+                measurement_intervals,
+                modelled_totals
+            )
+        ]
+    )
+    fit_residuals = residuals(calibration_result.x)
+    metrics = calculate_fit_metrics(
+        dates=dates,
+        measurement_intervals=measurement_intervals,
+        observed_totals=observed_totals,
+        modelled_totals=modelled_totals,
+        observed_daily=measured_midges,
+        modelled_daily=modelled_midges
+    )
+    return (
+        parameters, aquatic_midge, emergence, modelled_midges,
+        metrics
+    )
+
+
+def evaluate_season(
+    dates, temperatures, measurement_intervals, measured_midges, parameters
+):
+    """Run a fixed parameter set against one season's observations."""
+    aquatic_midge, emergence = simulate(temperatures, *parameters)
+    modelled_totals = np.array(aggregate_daily_values(
+        emergence, measurement_intervals
+    ))
+    modelled_midges = spread_interval_totals(
+        len(temperatures),
+        [
+            (first_day, last_day, total)
+            for (first_day, last_day, _), total in zip(
+                measurement_intervals,
+                modelled_totals
+            )
+        ]
+    )
+    observed_totals = np.array([
+        total for _, _, total in measurement_intervals
+    ])
+    metrics = calculate_fit_metrics(
+        dates=dates,
+        measurement_intervals=measurement_intervals,
+        observed_totals=observed_totals,
+        modelled_totals=modelled_totals,
+        observed_daily=measured_midges,
+        modelled_daily=modelled_midges
+    )
+    return aquatic_midge, modelled_midges, metrics
+
+
+def plot_season(pond_number, first_year, dates, temperatures, aquatic_midge,
+                modelled_midges, measured_midges):
+    """Plot model results for one season."""
+    label = season_label(first_year)
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(
+        dates, temperatures,
+        label='Measured/interpolated water temperature',
+        color='steelblue'
+    )
+    plt.axhline(
+        15.0, color='gray', linestyle='--',
+        label='15°C emergence threshold'
+    )
+    plt.xlabel('Date')
+    plt.ylabel('Temperature (°C)')
+    plt.title(f'Pond {pond_number} water temperature, {label}')
+    plt.grid(True)
+    plt.legend()
+    plt.gcf().autofmt_xdate()
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(dates, aquatic_midge, label='Aquatic midge (eggs+larvae+pupae)')
+    plt.xlabel('Date')
+    plt.ylabel('Number of aquatic midges')
+    plt.title(f'Aquatic midge population, pond {pond_number}, {label}')
+    plt.grid(True)
+    plt.legend()
+    plt.gcf().autofmt_xdate()
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(
+        dates, modelled_midges, '-',
+        label='Modelled interval-averaged emergence', color='orange'
+    )
+    plt.plot(
+        dates, measured_midges, '-',
+        label='Measured interval-averaged emergence', color='black'
+    )
+    plt.xlabel('Date')
+    plt.ylabel('Number of midges emerging')
+    plt.title(f'Interval-averaged midge emergence: pond {pond_number}, {label}')
+    plt.grid(True)
+    plt.legend()
+    plt.gcf().autofmt_xdate()
+
+
+def main():
+    plt.style.use('seaborn-v0_8')
+    calibration_pond, calibration_year = calibration_target
+    calibration_temperatures = load_temperature_data(calibration_pond)
+    calibration_counts = load_midge_data(calibration_pond)
+    calibration_data = load_season(
+        calibration_pond, calibration_year, calibration_temperatures,
+        calibration_counts
+    )
+    (
+        parameters, aquatic_midge, emergence, modelled_midges,
+        calibration_metrics
+    ) = calibrate_season(
+        *calibration_data
+    )
+
+    print(
+        f'Calibration: pond {calibration_pond} LT '
+        f'{season_label(calibration_year)}'
+    )
+    print(f'  k_oviposition = {parameters[0]:.6g}')
+    print(f'  k_emerge = {parameters[1]:.6g}')
+    print(f'  initial_cohort_size = {parameters[2]:.6g}')
+    final_aquatic_midge = aquatic_midge[-1]
+    print(f'  final aquatic midge count = {final_aquatic_midge:.6g}')
+    print(
+        f"  RMSE = {calibration_metrics['rmse']:.3f} midges/interval; "
+        f"NRMSE = {100 * calibration_metrics['nrmse']:.1f}%"
+    )
+    plot_season(
+        calibration_pond, calibration_year, calibration_data[0],
+        calibration_data[1], aquatic_midge, modelled_midges,
+        calibration_data[3]
+    )
+
+    validation_results = []
+    for pond_number, first_year in validation_targets:
+        temperatures_by_date = load_temperature_data(pond_number)
+        midge_counts_by_date = load_midge_data(pond_number)
+        season_data = load_season(
+            pond_number, first_year, temperatures_by_date,
+            midge_counts_by_date
+        )
+        validation_parameters = parameters
+        if (pond_number, first_year) == (2, 2025):
+            validation_parameters = parameters.copy()
+            validation_parameters[2] = final_aquatic_midge
+            print(
+                f'Pond 2 {season_label(first_year)} initial cohort size = '
+                f'{final_aquatic_midge:.6g}'
+            )
+        aquatic_midge, modelled_midges, metrics = evaluate_season(
+            *season_data, validation_parameters
+        )
+        validation_results.append((
+            pond_number, first_year, len(season_data[2]), metrics
+        ))
+        plot_season(
+            pond_number, first_year, season_data[0], season_data[1],
+            aquatic_midge, modelled_midges, season_data[3]
+        )
+
+    print('\nValidation results (calibration parameters held fixed):')
+    print(
+        'Pond/season | Intervals | MAE | RMSE | NRMSE | Seasonal bias | '
+        'Correlation | Peak error (days) | 50% cumulative error (days)'
+    )
+    for pond_number, first_year, interval_count, metrics in validation_results:
+        print(
+            f'Pond {pond_number} {season_label(first_year)} | '
+            f'{interval_count} | '
+            f"{metrics['mae']:.1f} | {metrics['rmse']:.1f} | "
+            f"{100 * metrics['nrmse']:.1f}% | "
+            f"{100 * metrics['seasonal_bias']:.1f}% | "
+            f"{metrics['correlation']:.3f} | "
+            f"{metrics['peak_date_error']} | "
+            f"{metrics['median_date_error']}"
+        )
+
+    plt.show()
+
+
+if __name__ == '__main__':
+    main()
